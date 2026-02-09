@@ -1,4 +1,4 @@
-# Python
+# Python / venv
 __pycache__/
 *.pyc
 *.pyo
@@ -6,6 +6,12 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+lib/
+lib64/
+bin/
+include/
+pyvenv.cfg
+pip-selfcheck.json
 
 # Playwright
 playwright-report/
