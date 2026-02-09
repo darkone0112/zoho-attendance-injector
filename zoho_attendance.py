@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from rich.console import Console
+from rich.prompt import Confirm, Prompt
+from rich.text import Text
+
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+
+BASE_URL = "https://people.zoho.eu/20096346973/"
+ATTENDANCE_URL = "https://people.zoho.eu/20096346973/zp#attendance/entry/summary-mode:list"
+
+MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+DEFAULTS = {
+    "include_weekends": False,
+    "step_delay": 0.6,
+    "nav_step_delay": 0.8,
+    "nav_timeout": 6.0,
+    "popup_timeout": 8.0,
+    "max_nav_steps": 80,
+}
+
+
+@dataclass
+class Settings:
+    cookies_path: Path
+    start_date: date
+    end_date: date
+    check_in: str
+    check_out: str
+    include_weekends: bool
+    headless: bool
+    slow_mo: int
+    step_delay: float
+    nav_step_delay: float
+    nav_timeout: float
+    popup_timeout: float
+    max_nav_steps: int
+    dry_run: bool
+    attendance_url: str
+    browser_channel: Optional[str]
+    debug: bool
+
+
+def parse_time(value: str) -> str:
+    if not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", value):
+        raise ValueError("Time must be in HH:mm (24h) format.")
+    return value
+
+
+def parse_iso_date(value: str) -> date:
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("Date must be in YYYY-MM-DD format.") from exc
+
+
+def parse_zoho_date(value: str) -> date:
+    match = re.match(r"^(\d{2})-([A-Za-z]{3})-(\d{4})$", value.strip())
+    if not match:
+        raise ValueError(f"Invalid Zoho date: {value}")
+    day = int(match.group(1))
+    month = MONTHS.get(match.group(2))
+    year = int(match.group(3))
+    if not month:
+        raise ValueError(f"Unknown month in date: {value}")
+    return date(year, month, day)
+
+
+def format_zoho_date(value: date) -> str:
+    month = list(MONTHS.keys())[list(MONTHS.values()).index(value.month)]
+    return f"{value.day:02d}-{month}-{value.year}"
+
+
+def enumerate_days(start: date, end: date) -> List[date]:
+    days = []
+    cursor = start
+    while cursor <= end:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days
+
+
+def load_cookies(path: Path) -> List[dict]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    cookies: List[dict] = []
+    for item in raw:
+        name = item.get("name")
+        value = item.get("value")
+        domain = item.get("domain")
+        if not name or value is None or not domain:
+            continue
+
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": item.get("path") or "/",
+            "secure": bool(item.get("secure")),
+            "httpOnly": bool(item.get("httpOnly")),
+        }
+
+        same_site = item.get("sameSite")
+        if same_site:
+            same_site = same_site.lower()
+            if same_site == "strict":
+                cookie["sameSite"] = "Strict"
+            elif same_site == "lax":
+                cookie["sameSite"] = "Lax"
+            elif same_site in ("none", "no_restriction"):
+                cookie["sameSite"] = "None"
+
+        if not item.get("session") and item.get("expirationDate"):
+            cookie["expires"] = float(item.get("expirationDate"))
+
+        cookies.append(cookie)
+
+    return cookies
+
+
+
+
+def prompt_for_range(console: Console) -> Tuple[date, date]:
+    today = date.today()
+    start_raw = Prompt.ask("Start date (YYYY-MM-DD)", default=today.isoformat())
+    end_raw = Prompt.ask("End date (YYYY-MM-DD)", default=today.isoformat())
+    start = parse_iso_date(start_raw)
+    end = parse_iso_date(end_raw)
+    if end < start:
+        raise ValueError("End date must be on or after start date.")
+    return start, end
+
+
+def prompt_for_time(console: Console, label: str, default_value: str) -> str:
+    value = Prompt.ask(label, default=default_value)
+    return parse_time(value)
+
+
+def _extract_range(text: str) -> Optional[Tuple[date, date]]:
+    cleaned = (text or "").replace("\u00a0", " ").strip()
+    matches = re.findall(r"\d{1,2}-[A-Za-z]{3}-\d{4}", cleaned)
+    if len(matches) < 2:
+        return None
+    return parse_zoho_date(matches[0]), parse_zoho_date(matches[1])
+
+
+def _range_candidates(scope) -> List[str]:
+    script = """
+    () => {
+      const el = document.querySelector('#ZPAtt_entryNavigation');
+      if (!el) return null;
+      const aria = el.getAttribute('aria-label') || '';
+      const bold = el.querySelector('b');
+      const text = (bold || el).innerText || '';
+      const content = el.textContent || '';
+      return [aria, text, content].filter(Boolean);
+    }
+    """
+    return scope.evaluate(script) or []
+
+
+def get_range_text(scope) -> str:
+    candidates = _range_candidates(scope)
+    if not candidates:
+        return ""
+    return candidates[0].replace("\u00a0", " ").strip()
+
+
+def get_displayed_range(scope) -> Tuple[date, date]:
+    candidates = _range_candidates(scope)
+    if not candidates:
+        raise RuntimeError("Week navigation element not found.")
+
+    for text in candidates:
+        parsed = _extract_range(text)
+        if parsed:
+            return parsed
+
+    raise RuntimeError(f"Unable to parse week range from: {candidates[0] if candidates else ''}")
+
+
+def wait_for_week_range(scope, timeout_s: float) -> Tuple[date, date]:
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            return get_displayed_range(scope)
+        except RuntimeError:
+            time.sleep(0.2)
+    raise PlaywrightTimeoutError("Week range not ready")
+
+
+def navigate_to_week(scope, target: date, settings: Settings, console: Console) -> bool:
+    for _ in range(settings.max_nav_steps):
+        try:
+            start, end = wait_for_week_range(scope, settings.nav_timeout)
+        except (PlaywrightTimeoutError, RuntimeError):
+            console.log("[red]Week range not ready yet. Retrying...[/red]")
+            time.sleep(settings.nav_step_delay)
+            continue
+        if settings.debug:
+            console.log(f"[debug] Header: {get_range_text(scope)}")
+            console.log(f"[debug] Parsed range: {format_zoho_date(start)} - {format_zoho_date(end)} | Target: {format_zoho_date(target)}")
+        if start <= target <= end:
+            return True
+
+        prev_text = get_range_text(scope)
+        direction = 1 if target < start else -1
+        if settings.debug:
+            console.log(f"[debug] Navigating {'previous' if direction == 1 else 'next'} week")
+        scope.evaluate("dir => Attendance.Entry.setMonthsNavigation(dir)", direction)
+        time.sleep(settings.nav_step_delay)
+
+        try:
+            scope.wait_for_function(
+                "prev => {"
+                "  const el = document.querySelector('#ZPAtt_entryNavigation');"
+                "  if (!el) return false;"
+                "  const text = (el.querySelector('b') || el).innerText.replace(/\\u00a0/g, ' ').trim();"
+                "  return text && text !== prev;"
+                "}",
+                arg=prev_text,
+                timeout=int(settings.nav_timeout * 1000),
+            )
+        except PlaywrightTimeoutError:
+            console.log("[red]Week navigation timed out.[/red]")
+            return False
+
+    console.log("[red]Reached max week navigation steps.[/red]")
+    return False
+
+
+def wait_for_day_rows(scope, timeout_s: float) -> None:
+    scope.wait_for_function(
+        "() => document.querySelectorAll('tr[onclick*=\"consEntriesPopup\"]').length > 0",
+        timeout=int(timeout_s * 1000),
+    )
+
+
+def click_day_row(scope, target: date, range_start: Optional[date]) -> bool:
+    offset = None
+    if range_start:
+        offset = (target - range_start).days
+
+    payload = {
+        "weekday": WEEKDAYS[target.weekday()],
+        "day": target.day,
+        "dayPadded": f"{target.day:02d}",
+        "formatted": format_zoho_date(target),
+        "iso": target.isoformat(),
+        "offset": offset,
+    }
+    script = """
+    (args) => {
+      const rows = Array.from(document.querySelectorAll('tr[onclick*="consEntriesPopup"]'));
+      if (rows.length === 0) return false;
+
+      if (typeof args.offset === 'number' && args.offset >= 0 && args.offset < rows.length) {
+        const row = rows[args.offset];
+        row.scrollIntoView({ block: 'center' });
+        row.click();
+        return true;
+      }
+
+      for (const row of rows) {
+        const attrs = [row.getAttribute('aria-label'), row.getAttribute('title'),
+          row.getAttribute('data-date'), row.dataset?.date].filter(Boolean).join(' ');
+        const text = `${row.textContent || ''} ${attrs}`;
+        if (text.includes(args.formatted) || text.includes(args.iso) ||
+            (text.includes(args.weekday) && (new RegExp('\\\\b' + args.dayPadded + '\\\\b').test(text) ||
+                                             new RegExp('\\\\b' + args.day + '\\\\b').test(text)))) {
+          row.scrollIntoView({ block: 'center' });
+          row.click();
+          return true;
+        }
+      }
+      return false;
+    }
+    """
+    return bool(scope.evaluate(script, payload))
+
+
+def wait_for_popup_scope(page, settings: Settings):
+    start = time.time()
+    selector = "#ZPAtt_entry_allEntriesList"
+    while time.time() - start < settings.popup_timeout:
+        if _has_selector(page, selector):
+            return page
+        for frame in page.frames:
+            if _has_selector(frame, selector):
+                return frame
+        time.sleep(0.2)
+    return None
+
+
+def wait_for_add_button(scope, settings: Settings) -> Optional[object]:
+    try:
+        locator = scope.locator(
+            "#ZPAtt_entry_allEntriesList div.zpl_lnkbg",
+            has_text=re.compile(r"Add Check-in\s*/\s*Check-out Entry", re.I),
+        )
+        locator.wait_for(timeout=int(settings.popup_timeout * 1000))
+        return locator
+    except PlaywrightError:
+        return None
+
+
+def _scope_has_time_inputs(scope) -> bool:
+    try:
+        root = "#ZPAtt_entry_allEntriesList"
+        if scope.query_selector(f'{root} [id^="ZPAtt_entry_editFromTime"][id$="-container"] input') and scope.query_selector(
+            f'{root} [id^="ZPAtt_entry_editToTime"][id$="-container"] input'
+        ):
+            return True
+        if scope.query_selector(f'{root} #ZPAtt_entry_editFromTime-container input') and scope.query_selector(
+            f'{root} #ZPAtt_entry_editToTime-container input'
+        ):
+            return True
+        hhmm = scope.query_selector_all(f'{root} input[placeholder="hh:mm"]')
+        if len(hhmm) >= 2:
+            return True
+    except PlaywrightError:
+        return False
+    return False
+
+
+def wait_for_time_inputs(scope, settings: Settings) -> bool:
+    start = time.time()
+    while time.time() - start < settings.popup_timeout:
+        if _scope_has_time_inputs(scope):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _resolve_time_inputs(scope):
+    root = "#ZPAtt_entry_allEntriesList"
+    from_sel = f'{root} [id^="ZPAtt_entry_editFromTime"][id$="-container"] input.zinputfield__textbox'
+    to_sel = f'{root} [id^="ZPAtt_entry_editToTime"][id$="-container"] input.zinputfield__textbox'
+    from_loc = scope.locator(from_sel)
+    to_loc = scope.locator(to_sel)
+    if from_loc.count() > 0 and to_loc.count() > 0:
+        return from_loc.first, to_loc.first
+
+    from_sel = f'{root} #ZPAtt_entry_editFromTime-container input.zinputfield__textbox'
+    to_sel = f'{root} #ZPAtt_entry_editToTime-container input.zinputfield__textbox'
+    from_loc = scope.locator(from_sel)
+    to_loc = scope.locator(to_sel)
+    if from_loc.count() > 0 and to_loc.count() > 0:
+        return from_loc.first, to_loc.first
+
+    hhmm = scope.locator(f'{root} input[placeholder="hh:mm"]')
+    if hhmm.count() >= 2:
+        return hhmm.nth(0), hhmm.nth(1)
+
+    return None, None
+
+
+def _normalize_time(value: str) -> str:
+    return value.replace(" ", "")
+
+
+def _parse_time_value(value: str) -> Optional[Tuple[int, int]]:
+    match = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{2})\s*$", value or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _time_matches(value: str, target_hours: int, target_minutes: int) -> bool:
+    parsed = _parse_time_value(_normalize_time(value))
+    if not parsed:
+        return False
+    return parsed == (target_hours, target_minutes)
+
+
+def _type_time(locator, value: str, prefer_space: bool = False) -> bool:
+    hours, minutes = value.split(":")
+
+    def _read_value() -> str:
+        try:
+            return _normalize_time(locator.input_value())
+        except PlaywrightError:
+            return ""
+
+    def _click_left():
+        try:
+            box = locator.bounding_box()
+            if box:
+                locator.click(position={"x": max(2, box["width"] * 0.2), "y": box["height"] / 2})
+                return
+        except PlaywrightError:
+            pass
+        locator.click()
+
+    def _method_arrow() -> None:
+        _click_left()
+        locator.press("Home")
+        locator.type(hours, delay=80)
+        locator.press("ArrowRight")
+        locator.press("ArrowRight")
+        locator.type(minutes, delay=80)
+        locator.press("Enter")
+
+    def _method_space() -> None:
+        _click_left()
+        locator.press("Home")
+        locator.press(hours[0])
+        locator.press("ArrowRight")
+        locator.press(hours[1])
+        locator.press("Space")
+        locator.press(minutes[0])
+        locator.press(minutes[1])
+        locator.press("Enter")
+
+    methods = [_method_space, _method_arrow] if prefer_space else [_method_arrow, _method_space]
+    for _ in range(3):
+        for method in methods:
+            try:
+                method()
+            except PlaywrightError:
+                pass
+            if _read_value() == value:
+                return True
+        time.sleep(0.2)
+
+    # Fallback: direct set + events.
+    try:
+        locator.evaluate(
+            "(el, val) => {"
+            "  el.value = val;"
+            "  el.dispatchEvent(new Event('input', { bubbles: true }));"
+            "  el.dispatchEvent(new Event('change', { bubbles: true }));"
+            "  el.dispatchEvent(new Event('blur', { bubbles: true }));"
+            "}",
+            value,
+        )
+    except PlaywrightError:
+        pass
+
+    return _read_value() == value
+
+
+def _set_time_by_arrows(locator, value: str) -> bool:
+    target_hours, target_minutes = map(int, value.split(":"))
+    if target_minutes != 0:
+        return False
+
+    def _read_value() -> str:
+        try:
+            return _normalize_time(locator.input_value())
+        except PlaywrightError:
+            return ""
+
+    def _select_segment(segment: str) -> None:
+        # segment: "hh" or "mm"
+        try:
+            locator.evaluate(
+                "(el, seg) => {"
+                "  const start = seg === 'hh' ? 0 : 3;"
+                "  const end = seg === 'hh' ? 2 : 5;"
+                "  el.focus();"
+                "  if (el.setSelectionRange) {"
+                "    el.setSelectionRange(start, end);"
+                "  }"
+                "}",
+                segment,
+            )
+        except PlaywrightError:
+            pass
+
+    def _focus_hours():
+        try:
+            locator.click()
+        except PlaywrightError:
+            return
+        _select_segment("hh")
+
+    _focus_hours()
+    for _ in range(target_hours + 1):
+        try:
+            locator.press("ArrowUp")
+        except PlaywrightError:
+            return False
+        time.sleep(0.04)
+
+    try:
+        locator.press("Space")
+        _select_segment("mm")
+        locator.press("ArrowUp")
+    except PlaywrightError:
+        return False
+
+    try:
+        locator.press("Enter")
+    except PlaywrightError:
+        pass
+
+    return _time_matches(_read_value(), target_hours, 0)
+
+
+def fill_time_entries(scope, check_in: str, check_out: str, dry_run: bool) -> bool:
+    in_loc, out_loc = _resolve_time_inputs(scope)
+    if not in_loc or not out_loc:
+        return False
+
+    if dry_run:
+        return True
+
+    ok_in = _set_time_by_arrows(in_loc, check_in)
+    ok_out = _set_time_by_arrows(out_loc, check_out)
+    if not ok_in or not ok_out:
+        return False
+    if not ok_in or not ok_out:
+        return False
+
+    try:
+        save = scope.locator(
+            '#ZPAtt_entry_allEntriesList button',
+            has_text=re.compile(r"save", re.I),
+        )
+        if save.count() == 0:
+            save = scope.locator('button[onclick*="updateEntry"]')
+        if save.count() > 0:
+            save.first.click()
+            return True
+    except PlaywrightError:
+        return False
+    return False
+
+
+def _has_selector(scope, selector: str) -> bool:
+    try:
+        return scope.query_selector(selector) is not None
+    except PlaywrightError:
+        return False
+
+
+def _find_scope(page, selector: str):
+    if _has_selector(page, selector):
+        return page
+    for frame in page.frames:
+        if _has_selector(frame, selector):
+            return frame
+    return None
+
+
+def wait_for_scope(page, selector: str, timeout: float):
+    start = time.time()
+    while time.time() - start < timeout:
+        scope = _find_scope(page, selector)
+        if scope:
+            return scope
+        time.sleep(0.2)
+    return None
+
+
+def _any_scope_has(page, selector: str) -> bool:
+    if _has_selector(page, selector):
+        return True
+    for frame in page.frames:
+        if _has_selector(frame, selector):
+            return True
+    return False
+
+
+def is_login_page(page) -> bool:
+    selectors = [
+        "input#login_id",
+        "input[name=\"LOGIN_ID\"]",
+        "input#email",
+        "input[type=\"email\"]",
+        "form[action*=\"signin\"]",
+        "form[action*=\"login\"]",
+    ]
+    return any(_any_scope_has(page, sel) for sel in selectors)
+
+
+def is_federated_login_page(page) -> bool:
+    selectors = [
+        "span.fed_div.small_box.MS_icon[title*=\"Microsoft\"]",
+    ]
+    return any(_any_scope_has(page, sel) for sel in selectors)
+
+
+def try_microsoft_login(page, console: Console) -> bool:
+    selector = "span.fed_div.small_box.MS_icon[title*=\"Microsoft\"]"
+    scope = wait_for_scope(page, selector, 10.0)
+    if not scope:
+        console.log("[red]Microsoft login button not found.[/red]")
+        return False
+
+    try:
+        scope.locator(selector).first.click()
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except PlaywrightError:
+        return False
+    except PlaywrightTimeoutError:
+        pass
+    return True
+
+
+def navigate_next_week(scope, settings: Settings, console: Console) -> bool:
+    prev_text = get_range_text(scope)
+    scope.evaluate("Attendance.Entry.setMonthsNavigation(-1)")
+    time.sleep(settings.nav_step_delay)
+    try:
+        scope.wait_for_function(
+            "prev => {"
+            "  const el = document.querySelector('#ZPAtt_entryNavigation');"
+            "  if (!el) return false;"
+            "  const aria = el.getAttribute('aria-label') || '';"
+            "  const bold = el.querySelector('b');"
+            "  const text = (bold || el).innerText.replace(/\\u00a0/g, ' ').trim();"
+            "  const current = text || aria.replace(/\\u00a0/g, ' ');"
+            "  return current && current !== prev;"
+            "}",
+            arg=prev_text,
+            timeout=int(settings.nav_timeout * 1000),
+        )
+    except PlaywrightTimeoutError:
+        console.log("[red]Next-week navigation timed out.[/red]")
+        return False
+    return True
+
+
+def test_cookies_login(
+    console: Console,
+    cookies_path: Path,
+    attendance_url: str,
+    browser_channel: Optional[str],
+) -> int:
+    cookies = load_cookies(cookies_path)
+    console.log("Opening Zoho People with injected cookies...")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=0, channel=browser_channel)
+        context = browser.new_context()
+        context.add_cookies(cookies)
+        page = context.new_page()
+
+        page.goto(BASE_URL, wait_until="domcontentloaded")
+        page.goto(attendance_url, wait_until="domcontentloaded")
+
+        scope = wait_for_scope(page, "#ZPAtt_entryNavigation", 15.0)
+        if not scope and is_federated_login_page(page):
+            if settings.headless:
+                console.log("[yellow]Microsoft login required but running headless. Rerun with --headed.[/yellow]")
+                browser.close()
+                return 1
+            console.log("[yellow]Microsoft login required. Attempting click...[/yellow]")
+            clicked = try_microsoft_login(page, console)
+            if not clicked:
+                console.log("[yellow]Please click 'Sign in with Microsoft' in the opened browser.[/yellow]")
+            scope = wait_for_scope(page, "#ZPAtt_entryNavigation", 180.0)
+
+        if scope:
+            console.log("[green]Attendance page loaded. Cookies appear valid.[/green]")
+        else:
+            if is_login_page(page):
+                console.log("[red]Login page detected. Cookies are likely expired.[/red]")
+            if is_federated_login_page(page):
+                console.log("[yellow]Microsoft login still required. Complete it in the browser.[/yellow]")
+            console.log(f"[yellow]Attendance navigation not found. Current URL: {page.url}[/yellow]")
+
+        console.input("Press Enter to close the browser...")
+        browser.close()
+
+    return 0
+
+
+def run(settings: Settings) -> int:
+    console = Console()
+
+    cookies = load_cookies(settings.cookies_path)
+    console.log(
+        f"Filling days from {format_zoho_date(settings.start_date)} to {format_zoho_date(settings.end_date)}"
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=settings.headless,
+            slow_mo=settings.slow_mo,
+            channel=settings.browser_channel,
+        )
+        context = browser.new_context()
+        context.add_cookies(cookies)
+        page = context.new_page()
+
+        page.goto(BASE_URL, wait_until="domcontentloaded")
+        page.goto(settings.attendance_url, wait_until="domcontentloaded")
+
+        scope = wait_for_scope(page, "#ZPAtt_entryNavigation", 15.0)
+        if not scope and is_federated_login_page(page):
+            console.log("[yellow]Microsoft login required. Attempting click...[/yellow]")
+            clicked = try_microsoft_login(page, console)
+            if not clicked:
+                console.log("[yellow]Please click 'Sign in with Microsoft' in the opened browser.[/yellow]")
+            scope = wait_for_scope(page, "#ZPAtt_entryNavigation", 180.0)
+
+        if not scope:
+            if is_login_page(page):
+                console.log("[red]Login page detected. Cookies may be expired or invalid.[/red]")
+            if is_federated_login_page(page):
+                console.log("[yellow]Microsoft login still required. Complete it in the browser.[/yellow]")
+                if settings.headless:
+                    console.log("[yellow]Headless mode cannot complete interactive login. Rerun with --headed.[/yellow]")
+            console.log(f"[red]Attendance navigation not found. Current URL: {page.url}[/red]")
+            browser.close()
+            return 1
+
+        scope.wait_for_function(
+            "() => window.Attendance && Attendance.Entry && Attendance.Entry.setMonthsNavigation",
+            timeout=15000,
+        )
+
+        if not navigate_to_week(scope, settings.start_date, settings, console):
+            console.log(f"[red]Failed to reach week for {format_zoho_date(settings.start_date)}[/red]")
+            browser.close()
+            return 1
+
+        while True:
+            try:
+                week_start, week_end = wait_for_week_range(scope, settings.nav_timeout)
+            except (PlaywrightTimeoutError, RuntimeError):
+                console.log("[red]Unable to read current week range.[/red]")
+                break
+
+            if settings.debug:
+                console.log(f"[debug] Active week: {format_zoho_date(week_start)} - {format_zoho_date(week_end)}")
+
+            range_start = max(settings.start_date, week_start)
+            range_end = min(settings.end_date, week_end)
+
+            try:
+                wait_for_day_rows(scope, settings.popup_timeout)
+            except PlaywrightTimeoutError:
+                console.log(f"[red]Day rows not loaded for {format_zoho_date(range_start)}[/red]")
+                break
+
+            for day in enumerate_days(range_start, range_end):
+                if not settings.include_weekends and day.weekday() in (5, 6):
+                    continue
+
+                clicked = False
+                for attempt in range(3):
+                    clicked = click_day_row(scope, day, week_start)
+                    if clicked:
+                        break
+                    time.sleep(0.4)
+
+                if not clicked:
+                    console.log(f"[red]Day row not found for {format_zoho_date(day)}[/red]")
+                    continue
+
+                popup_scope = wait_for_popup_scope(page, settings)
+                if not popup_scope:
+                    console.log(f"[red]Popup container not found for {format_zoho_date(day)}[/red]")
+                    continue
+
+                add_button = wait_for_add_button(popup_scope, settings)
+                if not add_button:
+                    console.log(f"[red]Add entry button not found for {format_zoho_date(day)}[/red]")
+                    continue
+
+                if not settings.dry_run:
+                    add_button.click()
+
+                time.sleep(settings.step_delay)
+
+                if not wait_for_time_inputs(popup_scope, settings):
+                    console.log(f"[red]Time inputs not found for {format_zoho_date(day)}[/red]")
+                    continue
+
+                ok = fill_time_entries(popup_scope, settings.check_in, settings.check_out, settings.dry_run)
+                if not ok:
+                    console.log(f"[red]Failed to fill inputs for {format_zoho_date(day)}[/red]")
+                else:
+                    console.log(f"[green]Filled {format_zoho_date(day)} ({WEEKDAYS[day.weekday()]})[/green]")
+
+                time.sleep(settings.step_delay)
+
+            if settings.end_date <= week_end:
+                break
+
+            if not navigate_next_week(scope, settings, console):
+                break
+
+        browser.close()
+
+    return 0
+
+
+def build_settings(args: argparse.Namespace, console: Console) -> Settings:
+    if args.start_date and args.end_date:
+        start = parse_iso_date(args.start_date)
+        end = parse_iso_date(args.end_date)
+    else:
+        start, end = prompt_for_range(console)
+
+    if args.check_in:
+        check_in = parse_time(args.check_in)
+    else:
+        check_in = prompt_for_time(console, "Check-in time (HH:mm)", "09:00")
+
+    if args.check_out:
+        check_out = parse_time(args.check_out)
+    else:
+        check_out = prompt_for_time(console, "Check-out time (HH:mm)", "18:00")
+
+    if end < start:
+        raise ValueError("End date must be on or after start date.")
+
+    if args.include_weekends and args.exclude_weekends:
+        console.log("[yellow]Both --include-weekends and --exclude-weekends set. Excluding weekends.[/yellow]")
+    include_weekends = args.include_weekends and not args.exclude_weekends
+    return Settings(
+        cookies_path=Path(args.cookies),
+        start_date=start,
+        end_date=end,
+        check_in=check_in,
+        check_out=check_out,
+        include_weekends=include_weekends,
+        headless=not args.headed,
+        slow_mo=args.slow_mo,
+        step_delay=args.step_delay,
+        nav_step_delay=args.nav_step_delay,
+        nav_timeout=args.nav_timeout,
+        popup_timeout=args.popup_timeout,
+        max_nav_steps=args.max_nav_steps,
+        dry_run=args.dry_run,
+        attendance_url=args.attendance_url,
+        browser_channel=args.browser_channel,
+        debug=args.debug,
+    )
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Zoho attendance filler (cookie-based)")
+    parser.add_argument(
+        "--cookies",
+        default="data/zoho-cookies.json",
+        help="Path to cookie JSON file",
+    )
+    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--check-in", help="Check-in time (HH:mm)")
+    parser.add_argument("--check-out", help="Check-out time (HH:mm)")
+    parser.add_argument("--exclude-weekends", action="store_true", default=False)
+    parser.add_argument("--include-weekends", action="store_true", default=False)
+    parser.add_argument("--headed", action="store_true", help="Run browser with UI")
+    parser.add_argument(
+        "--browser-channel",
+        choices=["chrome", "msedge", "chromium"],
+        default=None,
+        help="Use a specific browser channel if available",
+    )
+    parser.add_argument("--slow-mo", type=int, default=0, help="Slow motion delay in ms")
+    parser.add_argument("--step-delay", type=float, default=DEFAULTS["step_delay"])
+    parser.add_argument("--nav-step-delay", type=float, default=DEFAULTS["nav_step_delay"])
+    parser.add_argument("--nav-timeout", type=float, default=DEFAULTS["nav_timeout"])
+    parser.add_argument("--popup-timeout", type=float, default=DEFAULTS["popup_timeout"])
+    parser.add_argument("--max-nav-steps", type=int, default=DEFAULTS["max_nav_steps"])
+    parser.add_argument("--dry-run", action="store_true", help="Navigate without saving")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
+    parser.add_argument(
+        "--attendance-url",
+        default=ATTENDANCE_URL,
+        help="Attendance entry URL",
+    )
+    parser.add_argument(
+        "--action",
+        choices=["fill-range", "test-cookies"],
+        default=None,
+        help="Run a specific action and skip the menu",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str]) -> int:
+    console = Console()
+    args = parse_args(argv)
+
+    action = args.action
+    if not action:
+        console.print(Text("Select an option:", style="bold"))
+        console.print("1) Fill a date range")
+        console.print("2) Test cookie login")
+        console.print("3) Exit")
+        choice = Prompt.ask("Choice", choices=["1", "2", "3"], default="1")
+        if choice == "1":
+            action = "fill-range"
+        elif choice == "2":
+            action = "test-cookies"
+        else:
+            return 0
+
+    cookies_path = Path(args.cookies)
+    if not cookies_path.exists():
+        console.print(Text(f"Cookie file not found: {cookies_path}", style="red"))
+        return 1
+
+    if action == "test-cookies":
+        return test_cookies_login(
+            console=console,
+            cookies_path=cookies_path,
+            attendance_url=args.attendance_url,
+            browser_channel=args.browser_channel,
+        )
+
+    if action == "fill-range" and not args.headed:
+        open_ui = Confirm.ask(
+            "Open browser UI? (recommended for Microsoft login)",
+            default=True,
+        )
+        if open_ui:
+            args.headed = True
+
+    try:
+        settings = build_settings(args, console)
+    except ValueError as exc:
+        console.print(Text(str(exc), style="red"))
+        return 1
+
+    if not settings.include_weekends and settings.start_date == settings.end_date:
+        if settings.start_date.weekday() in (5, 6):
+            proceed = Confirm.ask("Selected date is a weekend and weekends are excluded. Continue anyway?", default=False)
+            if not proceed:
+                return 1
+
+    return run(settings)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

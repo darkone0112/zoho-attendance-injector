@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Playwright
+playwright-report/
+
+# Local data (keep folder structure)
+data/*
+!data/.gitkeep
