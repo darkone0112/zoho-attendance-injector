@@ -2,7 +2,7 @@
 
 Cookie-injected Playwright automation for Zoho People attendance and On Duty (WFH) requests.
 
-Yes, this is obviously a serious scraping practice project and absolutely not a way to avoid doing repetitive clicks every day.
+Built for scraping practice, DOM automation drills, and absolutely not because some modern companies still run attendance like it is a sacred 2009 ritual of daily manual clicks.
 
 ## What This Repo Contains
 - `zoho_attendance.py`: main CLI app (menu, browser automation, date logic, retries, logging).
@@ -150,12 +150,6 @@ python zoho_attendance.py \
 - Behavior: file is cleared at each run, then all actions are appended.
 - Includes click-level traces for critical On Duty date-picker operations.
 
-## Git Hygiene
-- `.gitignore` keeps local runtime data/logs out of commits while preserving folder structure:
-  - `data/*` except `data/.gitkeep`
-  - `logs/*` except `logs/.gitkeep`
-  - local venv artifacts
-
 ## Troubleshooting
 - Redirected to login page:
   - Cookies are stale/invalid, or SSO step is required.
@@ -165,9 +159,6 @@ python zoho_attendance.py \
 - Dates/times not filling:
   - Increase `--step-delay` and `--popup-timeout`.
   - Keep UI headed while tuning selectors/behavior.
-- Large git push rejected:
-  - Ensure you are not tracking venv or Playwright binaries.
-  - Check `git status` and remove tracked large files from index.
 
 ## Disclaimer
 Use this only where you are authorized to automate.  
