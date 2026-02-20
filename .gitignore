@@ -19,3 +19,8 @@ playwright-report/
 # Local data (keep folder structure)
 data/*
 !data/.gitkeep
+
+# Runtime logs (keep folder structure)
+logs/**
+!logs/
+!logs/.gitkeep
