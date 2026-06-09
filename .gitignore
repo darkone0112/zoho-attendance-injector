@@ -1,26 +1,2 @@
-# Python / venv
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.egg-info/
-.venv/
-venv/
-lib/
-lib64/
-bin/
-include/
-pyvenv.cfg
-pip-selfcheck.json
-
-# Playwright
-playwright-report/
-
-# Local data (keep folder structure)
-data/*
-!data/.gitkeep
-
-# Runtime logs (keep folder structure)
-logs/**
-!logs/
-!logs/.gitkeep
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*
