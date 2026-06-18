@@ -6,7 +6,11 @@ This document describes the exact sequence used to fill attendance for a user-sp
 - Start date (YYYY-MM-DD)
 - End date (YYYY-MM-DD)
 - Check-in time (HH:mm)
-- Check-out time (HH:mm)
+- Standard check-out time (HH:mm)
+
+Summer schedule:
+- From June 15 through September 15, inclusive, the check-out time is one hour earlier.
+- Example: a standard check-out of `18:00` is filled as `17:00` on those dates.
 
 ## Page State Assumptions
 - The page always opens on the **current week**.
@@ -27,7 +31,7 @@ This document describes the exact sequence used to fill attendance for a user-sp
 5. For each day to fill:
    - Click the day row (the row with `onclick="Attendance.Entry.consEntriesPopup(this)"`).
    - In the popup, click **Add Check-in / Check-out Entry**.
-   - Fill **check-in** and **check-out** time inputs (HH:mm 24h).
+   - Fill **check-in** and date-adjusted **check-out** time inputs (HH:mm 24h).
    - Click **Save** (`Attendance.Entry.updateEntry(...)`).
 6. After finishing the visible week, move to the **next week** and repeat step 4.
 7. Stop when the end date has been filled.

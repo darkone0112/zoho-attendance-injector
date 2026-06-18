@@ -34,6 +34,10 @@
     dryRun: false,
   };
 
+  const SUMMER_WORKDAY_START = { month: 5, day: 15 };
+  const SUMMER_WORKDAY_END = { month: 8, day: 15 };
+  const SUMMER_CHECK_OUT_OFFSET_HOURS = -1;
+
   const SETTINGS = {
     includeWeekends: CONFIG.includeWeekends ?? DEFAULTS.includeWeekends,
     stepDelayMs: CONFIG.stepDelayMs ?? DEFAULTS.stepDelayMs,
@@ -58,6 +62,29 @@
   };
 
   const isValidTime = (value) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
+
+  const isSummerWorkdaySchedule = (date) => {
+    const start = new Date(date.getFullYear(), SUMMER_WORKDAY_START.month, SUMMER_WORKDAY_START.day);
+    const end = new Date(date.getFullYear(), SUMMER_WORKDAY_END.month, SUMMER_WORKDAY_END.day);
+    return date >= start && date <= end;
+  };
+
+  const shiftTime = (value, hours) => {
+    if (!isValidTime(value)) throw new Error('Time must be in HH:mm (24h) format.');
+    const [timeHours, timeMinutes] = value.split(':').map(Number);
+    const dayMinutes = 24 * 60;
+    const totalMinutes = (timeHours * 60 + timeMinutes + hours * 60 + dayMinutes) % dayMinutes;
+    const shiftedHours = Math.floor(totalMinutes / 60);
+    const shiftedMinutes = totalMinutes % 60;
+    return `${String(shiftedHours).padStart(2, '0')}:${String(shiftedMinutes).padStart(2, '0')}`;
+  };
+
+  const checkOutForDay = (date, standardCheckOut) => {
+    if (isSummerWorkdaySchedule(date)) {
+      return shiftTime(standardCheckOut, SUMMER_CHECK_OUT_OFFSET_HOURS);
+    }
+    return standardCheckOut;
+  };
 
   const parseIsoDate = (value) => {
     const match = /^\s*(\d{4})-(\d{2})-(\d{2})\s*$/.exec(value || '');
@@ -347,7 +374,7 @@
         break;
       }
 
-      await fillDay(day, checkIn, checkOut);
+      await fillDay(day, checkIn, checkOutForDay(day, checkOut));
       await sleep(SETTINGS.stepDelayMs);
     }
 

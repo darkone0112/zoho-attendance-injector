@@ -58,6 +58,9 @@ The app loops back to the menu after each action.
 - Skips weekends by default.
 - Navigates week-by-week in Zoho until target range is covered.
 - Uses robust popup/input handling and verifies time values before save.
+- Applies summer schedule automatically from June 15 through September 15, inclusive:
+  - Check-out is one hour earlier than the configured `--check-out`.
+  - Example: `18:00` becomes `17:00` for summer dates.
 
 Range selection behavior:
 - If no CLI dates were passed, it asks:
@@ -129,7 +132,7 @@ python zoho_attendance.py \
 | `--start-date` | interactive | fill, remote | Range start (`YYYY-MM-DD`). |
 | `--end-date` | interactive | fill, remote | Range end (`YYYY-MM-DD`). |
 | `--check-in` | prompt default `09:00` | fill | Check-in time (`HH:mm`). |
-| `--check-out` | prompt default `18:00` | fill | Check-out time (`HH:mm`). |
+| `--check-out` | prompt default `18:00` | fill | Standard check-out time (`HH:mm`); summer dates use one hour earlier. |
 | `--exclude-weekends` | `false` | fill | Explicitly skip Sat/Sun. |
 | `--include-weekends` | `false` | fill | Include Sat/Sun (unless both weekend flags are set; exclude wins). |
 | `--headed` | `false` | fill, remote | Run browser with UI. |

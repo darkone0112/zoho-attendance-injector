@@ -52,6 +52,10 @@ DEFAULTS = {
     "max_nav_steps": 80,
 }
 
+SUMMER_WORKDAY_START = (6, 15)
+SUMMER_WORKDAY_END = (9, 15)
+SUMMER_CHECK_OUT_OFFSET_HOURS = -1
+
 
 @dataclass
 class Settings:
@@ -142,6 +146,25 @@ def enumerate_days(start: date, end: date) -> List[date]:
         days.append(cursor)
         cursor += timedelta(days=1)
     return days
+
+
+def is_summer_workday_schedule(day: date) -> bool:
+    start = date(day.year, *SUMMER_WORKDAY_START)
+    end = date(day.year, *SUMMER_WORKDAY_END)
+    return start <= day <= end
+
+
+def shift_time(value: str, hours: int) -> str:
+    parsed_hours, parsed_minutes = map(int, parse_time(value).split(":"))
+    total_minutes = (parsed_hours * 60 + parsed_minutes + hours * 60) % (24 * 60)
+    shifted_hours, shifted_minutes = divmod(total_minutes, 60)
+    return f"{shifted_hours:02d}:{shifted_minutes:02d}"
+
+
+def check_out_for_day(day: date, standard_check_out: str) -> str:
+    if is_summer_workday_schedule(day):
+        return shift_time(standard_check_out, SUMMER_CHECK_OUT_OFFSET_HOURS)
+    return standard_check_out
 
 
 def load_cookies(path: Path) -> List[dict]:
@@ -912,7 +935,14 @@ def run(settings: Settings) -> int:
                     console.log(f"[red]Time inputs not found for {format_zoho_date(day)}[/red]")
                     continue
 
-                ok = fill_time_entries(popup_scope, settings.check_in, settings.check_out, settings.dry_run)
+                check_out = check_out_for_day(day, settings.check_out)
+                if settings.debug and check_out != settings.check_out:
+                    console.log(
+                        f"[debug] Summer schedule for {format_zoho_date(day)}: "
+                        f"check-out {settings.check_out} -> {check_out}"
+                    )
+
+                ok = fill_time_entries(popup_scope, settings.check_in, check_out, settings.dry_run)
                 if not ok:
                     console.log(f"[red]Failed to fill inputs for {format_zoho_date(day)}[/red]")
                 else:
